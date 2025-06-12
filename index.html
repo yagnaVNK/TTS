@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Real-Time ASR → LLM → TTS Interface</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f4f4f4;
+      color: #333;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem;
+    }
+    .controls {
+      background: #fff;
+      padding: 1rem 2rem;
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+      margin-bottom: 1rem;
+      width: 100%;
+      max-width: 600px;
+    }
+    .controls label {
+      display: inline-block;
+      width: 45%;
+      margin-bottom: 0.5rem;
+    }
+    .controls input {
+      width: 60px;
+      margin-left: 0.5rem;
+    }
+    button {
+      margin: 0.5rem 0.25rem;
+      padding: 0.5rem 1rem;
+      border: none;
+      border-radius: 4px;
+      background: #007bff;
+      color: #fff;
+      cursor: pointer;
+    }
+    button:disabled {
+      background: #999;
+      cursor: not-allowed;
+    }
+    #log {
+      width: 100%;
+      max-width: 600px;
+      height: 300px;
+      overflow-y: auto;
+    }
+    .entry {
+      background: #fff;
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+      margin-bottom: 0.75rem;
+    }
+    .entry .label {
+      font-weight: bold;
+      margin-right: 0.5rem;
+    }
+    .probabilities {
+      margin-top: 0.5rem;
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 0.75rem;
+      margin-right: 0.5rem;
+      color: #fff;
+    }
+    .badge.lang { background: #17a2b8; }
+    .badge.sent { background: #28a745; }
+  </style>
+</head>
+<body>
+  <div class="controls">
+    <label>Chunk Size:<input id="chunkSize" type="number" value="512" /></label>
+    <label>Silence (sec):<input id="silenceSec" type="number" step="0.1" value="0.3" /></label>
+    <label>VAD Threshold:<input id="vadThreshold" type="number" step="0.01" value="0.3" /></label>
+    <label>LangProb Threshold:<input id="langThreshold" type="number" step="0.01" value="0.7" /></label>
+    <label>SentProb Threshold:<input id="sentThreshold" type="number" step="0.01" value="0.5" /></label>
+    <div>
+      <button id="startBtn">Start Listening</button>
+      <button id="stopBtn" disabled>Stop</button>
+    </div>
+  </div>
+
+  <div id="log"></div>
+
+  <!-- audio element for streaming playback -->
+  <audio id="ttsPlayer" controls></audio>
+
+  <script>
+    const VAD_URL   = 'http://localhost:8001/api/vad';
+    const ASR_URL   = 'http://localhost:8002/api/asr';
+    const CHAT_URL  = 'http://localhost:8003/api/chat';
+    const TTS_URL   = 'http://localhost:8004/synthesize';
+
+    let audioContext, processor, sourceStream;
+    let buffer = [];
+    let silenceCount = 0;
+    let isProcessing = false;
+
+    const ttsPlayer = document.getElementById('ttsPlayer');
+
+    function logSimple(label, text) {
+      const entry = document.createElement('div');
+      entry.className = 'entry';
+      entry.innerHTML = `<span class="label">${label}:</span> ${text}`;
+      document.getElementById('log').prepend(entry);
+    }
+
+    // Stream directly via the audio element, defaulting to English
+    async function playStreamingTTS(text, language) {
+      const url = `${TTS_URL}?text=${encodeURIComponent(text)}&language=${language}`;
+      ttsPlayer.src = url;
+      try {
+        await ttsPlayer.play();
+      } catch (e) {
+        console.error('TTS playback error', e);
+      }
+    }
+
+    async function startListening() {
+      const CHUNK           = +document.getElementById('chunkSize').value;
+      const SILENCE_FRAMES  = Math.floor(+document.getElementById('silenceSec').value * 16000 / CHUNK);
+      const VAD_THRESHOLD   = +document.getElementById('vadThreshold').value;
+      const LANG_THRESHOLD  = +document.getElementById('langThreshold').value;
+      const SENT_THRESHOLD  = +document.getElementById('sentThreshold').value;
+
+      document.getElementById('startBtn').disabled = true;
+      document.getElementById('stopBtn').disabled = false;
+
+      audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      sourceStream = audioContext.createMediaStreamSource(stream);
+      processor = audioContext.createScriptProcessor(CHUNK, 1, 1);
+
+      processor.onaudioprocess = async (evt) => {
+        if (isProcessing) return;
+
+        const input = evt.inputBuffer.getChannelData(0);
+        const vadResp = await fetch(VAD_URL, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ audio: Array.from(input), threshold: VAD_THRESHOLD })
+        }).then(r => r.json());
+
+        if (vadResp.is_speech) {
+          buffer.push(...input);
+          silenceCount = 0;
+        } else {
+          silenceCount++;
+          if (silenceCount > SILENCE_FRAMES && buffer.length) {
+            isProcessing = true;
+            const utter = buffer.slice();
+            buffer = [];
+            silenceCount = 0;
+
+            // ASR
+            const asrResp = await fetch(ASR_URL, {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({
+                audio: utter,
+                chunk: CHUNK,
+                lang_threshold: LANG_THRESHOLD,
+                sent_threshold: SENT_THRESHOLD
+              })
+            }).then(r => r.json());
+
+            // Show what user said
+            const userEntry = document.createElement('div');
+            userEntry.className = 'entry';
+            userEntry.innerHTML = `
+              <span class="label">You said:</span> ${asrResp.text}
+              <div class="probabilities">
+                <span class="badge sent">Lang: ${asrResp.lang_prob.toFixed(2)}</span>
+                <span class="badge sent">Sent: ${asrResp.sent_prob.toFixed(2)}</span>
+                <span class="badge sent">Sent: ${asrResp.language}</span>
+              </div>
+            `;
+            console.log(asrResp);
+            document.getElementById('log').prepend(userEntry);
+
+            // Chat or fallback
+            let replyText;
+            if (asrResp.is_confident) {
+              const chatResp = await fetch(CHAT_URL, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ input: asrResp.text })
+              }).then(r => r.json());
+              replyText = chatResp.reply;
+            } else {
+              replyText = 'Sorry, I didn’t catch that.';
+            }
+            logSimple('Assistant', replyText);
+
+            // TTS
+            await playStreamingTTS(replyText,asrResp.language);
+
+            isProcessing = false;
+          }
+        }
+      };
+
+      sourceStream.connect(processor);
+      processor.connect(audioContext.destination);
+    }
+
+    function stopListening() {
+      document.getElementById('startBtn').disabled = false;
+      document.getElementById('stopBtn').disabled = true;
+      if (processor) processor.disconnect();
+      if (sourceStream && sourceStream.mediaStream) {
+        sourceStream.mediaStream.getTracks().forEach(t => t.stop());
+      }
+      if (audioContext) audioContext.close();
+      buffer = [];
+      silenceCount = 0;
+      isProcessing = false;
+    }
+
+    document.getElementById('startBtn').addEventListener('click', startListening);
+    document.getElementById('stopBtn').addEventListener('click', stopListening);
+  </script>
+</body>
+</html>

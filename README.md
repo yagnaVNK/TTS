@@ -1,4 +1,29 @@
 
+uvicorn vad_service:app --port 8001
+uvicorn asr_service:app --port 8002
+uvicorn chat_service:app --port 8003
+uvicorn tts_service:app --port 8004
+D:\Users\kaasa\Documents\GithubAI\.venv\Scripts\activate 
+
+
+lsof -ti :8001 
+## used to check the ports that are currently used
+kill -9 5684
+## used to kill the process using the port
+
+
+
+
+source Projects/.venv/bin/activate && cd Projects/ && uvicorn vad_service:app --port 8001
+source Projects/.venv/bin/activate && cd Projects/ && uvicorn asr_service:app --port 8002
+source Projects/.venv/bin/activate && cd Projects/ && uvicorn chat_service:app --port 8003
+source Projects/.venv/bin/activate && cd Projects/ && uvicorn tts_service:app --port 8004
+
+
+sudo apt update && sudo apt install -y python3 && sudo mkdir -p /var/www/html && sudo cp ~/website/index.html /var/www/html/index.html && cd /var/www/html && sudo python3 -m http.server 8080
+
+
+
 ## 🐸Coqui.ai News
 - 📣 ⓍTTSv2 is here with 16 languages and better performance across the board.
 - 📣 ⓍTTS fine-tuning code is out. Check the [example recipes](https://github.com/coqui-ai/TTS/tree/dev/recipes/ljspeech).
