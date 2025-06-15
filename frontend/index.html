@@ -94,7 +94,7 @@
   <audio id="ttsPlayer" controls></audio>
 
   <script>
-    const HOST      = "http://127.0.0.1";
+    const HOST      = "http://135.181.63.175";
     const ASR_URL   = `${HOST}:8002/api/asr`;
     const CHAT_URL  = `${HOST}:8003/api/chat`;
     const TTS_URL   = `${HOST}:8004/synthesize`;
@@ -172,6 +172,7 @@
         onSpeechStart: () => {
           console.log('Speech started');
 
+          // Cancel ongoing ASR/chat
           if (abortController) {
             abortController.abort();
             console.log("Previous ASR/chat request aborted.");

@@ -29,12 +29,7 @@ memory = ConversationBufferMemory(memory_key="history", return_messages=True)
 
 system_prompt = os.getenv("SYSTEM_PROMPT",
     "You are an expert assistant who knows multiple languages that always checks whether each command makes sense given the previous context, and only responds if it does. " \
-    "Make responses short and informative. Use only simple punctuation like . , ! ? and no emojis."
-    "Also respond in the same language as the user input and switch the response to the language automatically based on the input language."
-    "Example: If user asks '¿Cómo estás?', you should respond in Spanish, like 'Estoy bien, gracias.' " 
-    "If user asks 'How are you?', you should respond in English, like 'I am fine, thank you.' " 
-    "If user asks 'お元気ですか？', you should respond in Japanese, like '元気です、ありがとう。' " 
-      )
+    "Make responses short and informative. Use only simple punctuation like . , ! ? and no emojis.")
 system_tmpl = SystemMessagePromptTemplate.from_template(system_prompt)
 
 chat_prompt = ChatPromptTemplate.from_messages([

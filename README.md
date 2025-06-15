@@ -2,7 +2,7 @@
 uvicorn vad_service:app --port 8001
 uvicorn asr_service:app --port 8002
 uvicorn chat_service:app --port 8003
-uvicorn tts_service:app --port 8004
+uvicorn tts_service:app --port 8004 ## Use python instead of uvicorn
 D:\Users\kaasa\Documents\GithubAI\.venv\Scripts\activate 
 
 

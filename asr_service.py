@@ -20,7 +20,12 @@ class ASRResponse(BaseModel):
     language: str
 
 app = FastAPI(title="ASR Microservice")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Load Whisper once
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -39,20 +44,28 @@ async def asr_endpoint(req: ASRRequest):
     lang_prob = info.language_probability
     sent_prob = float(np.exp(info.average_logprob))
     language_detected = info.language
-    #print(info.language)
+
     # optional threshold check
     is_confident = None
     if req.lang_threshold is not None and req.sent_threshold is not None:
-        is_confident = (lang_prob >= req.lang_threshold and sent_prob >= req.sent_threshold)
+        is_confident = (
+            lang_prob >= req.lang_threshold
+            and sent_prob >= req.sent_threshold
+        )
 
     return {
         "text": text,
         "lang_prob": lang_prob,
         "sent_prob": sent_prob,
         "is_confident": is_confident,
-        "language":language_detected
+        "language": language_detected
     }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("asr_service:app", host="0.0.0.0", port=int(os.getenv("PORT", 8002)), reload=True)
+    uvicorn.run(
+        "asr_service:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8002)),
+        reload=True,
+    )
