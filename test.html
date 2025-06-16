@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Real-Time ASR → LLM → TTS Pipeline</title>
+
+  <!-- Polyfill getUserMedia for older browsers -->
+  <script>
+    if (!navigator.mediaDevices) navigator.mediaDevices = {};
+    if (!navigator.mediaDevices.getUserMedia) {
+      navigator.mediaDevices.getUserMedia = function(constraints) {
+        const legacy = navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+        if (!legacy) return Promise.reject(new Error('getUserMedia not supported'));        
+        return new Promise((res, rej) => legacy.call(navigator, constraints, res, rej));
+      };
+    }
+  </script>
+
+  <!-- ONNX Runtime + Silero VAD -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.24/dist/bundle.min.js"></script>
+
+  <style>
+    body { font-family: Arial, sans-serif; padding: 2rem; background: #f4f4f4; }
+    .controls { margin-bottom: 1rem; }
+    button { padding: .5rem 1rem; margin-right: .5rem; font-size: 1rem; }
+    button:disabled { background: #ccc; cursor: not-allowed; }
+    #status { margin: 1rem 0; padding: .5rem; background: #e8f4fd; border-radius: 4px; }
+    #log { max-width: 600px; margin-top: 1rem; }
+    .entry { background: #fff; padding: .75rem; margin-bottom: .5rem; border-radius: 6px; }
+    .stage { font-weight: bold; margin-right: .5rem; }
+  </style>
+</head>
+<body>
+
+  <div class="controls">
+    <button id="startBtn">Start Listening</button>
+    <button id="stopBtn" disabled>Stop</button>
+  </div>
+
+  <div id="status">Status: Ready</div>
+  <div id="log"></div>
+
+  <script>
+    // ----- Derive WS_URL robustly -----
+    let WS_URL;
+    if (location.protocol === 'file:' || !location.origin.startsWith('http')) {
+      WS_URL = 'ws://localhost:8001/ws/pipeline';
+    } else {
+      WS_URL = location.origin.replace(/^http/, 'ws') + '/ws/pipeline';
+    }
+    console.log('WebSocket URL:', WS_URL);
+
+    // ----- Status and Log helpers -----
+    function setStatus(msg) {
+      document.getElementById('status').textContent = `Status: ${msg}`;
+    }
+
+    function log(stage, msg) {
+      const div = document.createElement('div');
+      div.className = 'entry';
+      div.innerHTML = `<span class="stage">[${stage.toUpperCase()}]</span>${msg}`;
+      document.getElementById('log').prepend(div);
+    }
+
+    // ----- Audio Management with Proper Sequencing -----
+    let audioCtx;
+    let currentPlaybackSession = null;
+
+    class AudioPlaybackSession {
+      constructor() {
+        this.chunks = [];
+        this.isPlaying = false;
+        this.isCancelled = false;
+        this.currentSource = null;
+        this.playbackStartTime = 0;
+        this.nextChunkStartTime = 0;
+      }
+
+      addChunk(pcmArray) {
+        if (this.isCancelled) return;
+        this.chunks.push(pcmArray);
+        if (!this.isPlaying) {
+          this.startPlayback();
+        }
+      }
+
+      async startPlayback() {
+        if (this.isPlaying || this.isCancelled) return;
+        this.isPlaying = true;
+        this.playbackStartTime = audioCtx.currentTime;
+        this.nextChunkStartTime = this.playbackStartTime;
+        
+        await this.playNextChunk();
+      }
+
+      async playNextChunk() {
+        if (this.isCancelled || this.chunks.length === 0) {
+          this.isPlaying = false;
+          return;
+        }
+
+        const chunk = this.chunks.shift();
+        const buffer = audioCtx.createBuffer(1, chunk.length, 8000); // Changed to 8kHz
+        buffer.getChannelData(0).set(chunk);
+        
+        const source = audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioCtx.destination);
+        
+        this.currentSource = source;
+        
+        // Schedule this chunk to start at the right time
+        const startTime = Math.max(this.nextChunkStartTime, audioCtx.currentTime);
+        source.start(startTime);
+        
+        // Calculate when the next chunk should start
+        this.nextChunkStartTime = startTime + buffer.duration;
+        
+        source.onended = () => {
+          if (!this.isCancelled) {
+            this.currentSource = null;
+            // Reduced delay for 8kHz
+            setTimeout(() => this.playNextChunk(), 5);
+          }
+        };
+      }
+
+      cancel() {
+        this.isCancelled = true;
+        this.isPlaying = false;
+        this.chunks = [];
+        
+        if (this.currentSource) {
+          try {
+            this.currentSource.stop();
+          } catch (e) {
+            // Source might already be stopped
+          }
+          this.currentSource = null;
+        }
+      }
+    }
+
+    function startNewPlaybackSession() {
+      if (currentPlaybackSession) {
+        currentPlaybackSession.cancel();
+      }
+      currentPlaybackSession = new AudioPlaybackSession();
+      return currentPlaybackSession;
+    }
+
+    function stopAllPlayback() {
+      if (currentPlaybackSession) {
+        currentPlaybackSession.cancel();
+        currentPlaybackSession = null;
+      }
+    }
+
+    // ----- State -----
+    let micStream, vadInstance, ws;
+    let isProcessing = false;
+
+    // ----- WebSocket Message Handler -----
+    function handleWebSocketMessage(evt) {
+      if (typeof evt.data === 'string') {
+        const obj = JSON.parse(evt.data);
+        
+        switch (obj.stage) {
+          case 'cancel':
+            log('cancel', 'Stopping playback');
+            stopAllPlayback();
+            isProcessing = false;
+            setStatus('Ready');
+            break;
+            
+          case 'asr':
+            log('asr', `Text: ${obj.text} <em>(${obj.language})</em>`);
+            setStatus('Processing...');
+            break;
+            
+          case 'chat':
+            log('chat', obj.reply);
+            setStatus('Generating speech...');
+            // Start a new playback session when we get the chat response
+            startNewPlaybackSession();
+            break;
+        }
+      } else {
+        // Binary TTS chunk
+        if (currentPlaybackSession && !currentPlaybackSession.isCancelled) {
+          const pcm = new Float32Array(evt.data);
+          currentPlaybackSession.addChunk(pcm);
+          setStatus('Playing response...');
+        }
+      }
+    }
+
+    // ----- Start -----
+    async function startListening() {
+      document.getElementById('startBtn').disabled = true;
+      document.getElementById('stopBtn').disabled = false;
+      setStatus('Initializing...');
+
+      try {
+        // Set up AudioContext first
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 8000 }); // Changed to 8kHz
+        
+        // Resume audio context if needed (browser autoplay policy)
+        if (audioCtx.state === 'suspended') {
+          await audioCtx.resume();
+        }
+
+        // Open WebSocket connection
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          ws = new WebSocket(WS_URL);
+          ws.binaryType = 'arraybuffer';
+          
+          ws.onopen = () => {
+            log('ws', 'Connected');
+            setStatus('Connected');
+          };
+          
+          ws.onclose = () => {
+            log('ws', 'Closed');
+            setStatus('Disconnected');
+          };
+          
+          ws.onerror = e => {
+            log('ws', 'Error: ' + e.message);
+            setStatus('Connection error');
+          };
+          
+          ws.onmessage = handleWebSocketMessage;
+          
+          // Wait for connection to open
+          await new Promise((resolve, reject) => {
+            ws.onopen = () => {
+              log('ws', 'Connected');
+              setStatus('Connected');
+              resolve();
+            };
+            ws.onerror = reject;
+            setTimeout(reject, 5000); // 5 second timeout
+          });
+        }
+
+        // Get microphone stream
+        micStream = await navigator.mediaDevices.getUserMedia({ 
+          audio: {
+            sampleRate: 8000,  // Changed to 8kHz
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true
+          }
+        });
+
+        // Set up VAD
+        vadInstance = await vad.MicVAD.new({
+          wasmURL: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort-wasi.wasm',
+          onnxURL: 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.24/dist/silero_vad.onnx',
+          workletURL: 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.24/dist/vad.worklet.bundle.min.js',
+          stream: micStream,
+          
+          onSpeechStart: () => {
+            log('vad', 'Speech started');
+            // Immediately stop any ongoing playback
+            stopAllPlayback();
+            isProcessing = true;
+            setStatus('Listening...');
+          },
+          
+          onSpeechEnd: audioBuffer => {
+            if (isProcessing) {
+              log('vad', 'Speech ended, sending...');
+              setStatus('Processing speech...');
+              
+              if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(audioBuffer.buffer);
+              } else {
+                log('error', 'WebSocket not connected');
+                setStatus('Connection error');
+                isProcessing = false;
+              }
+            }
+          }
+        });
+
+        await vadInstance.start();
+        setStatus('Listening for speech...');
+        log('app', 'Started successfully');
+        
+      } catch (error) {
+        log('error', 'Failed to start: ' + error.message);
+        setStatus('Error: ' + error.message);
+        
+        // Clean up on error
+        document.getElementById('startBtn').disabled = false;
+        document.getElementById('stopBtn').disabled = true;
+      }
+    }
+
+    // ----- Stop -----
+    function stopListening() {
+      document.getElementById('startBtn').disabled = false;
+      document.getElementById('stopBtn').disabled = true;
+      
+      isProcessing = false;
+      
+      if (vadInstance) {
+        vadInstance.pause();
+        vadInstance = null;
+      }
+      
+      if (micStream) {
+        micStream.getTracks().forEach(t => t.stop());
+        micStream = null;
+      }
+      
+      if (audioCtx) {
+        audioCtx.close();
+        audioCtx = null;
+      }
+      
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
+      
+      stopAllPlayback();
+      setStatus('Stopped');
+      log('app', 'Stopped');
+    }
+
+    // Event listeners
+    document.getElementById('startBtn').onclick = startListening;
+    document.getElementById('stopBtn').onclick = stopListening;
+
+    // Clean up on page unload
+    window.addEventListener('beforeunload', stopListening);
+  </script>
+</body>
+</html>

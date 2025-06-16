@@ -28,8 +28,12 @@ llm = ChatOllama(model=model_name)
 memory = ConversationBufferMemory(memory_key="history", return_messages=True)
 
 system_prompt = os.getenv("SYSTEM_PROMPT",
-    "You are an expert assistant who knows multiple languages that always checks whether each command makes sense given the previous context, and only responds if it does. " \
-    "Make responses short and informative. Use only simple punctuation like . , ! ? and no emojis.")
+    """You are an expert assistant who knows multiple languages that always checks whether each command makes sense given the previous context, and only responds if it does. 
+    Make responses short and informative. Use only simple punctuation like . , ! ? and no emojis.
+     If the user writes in English, respond in English.
+If the user writes in Spanish, respond in Spanish.
+If the user writes in French, respond in French.
+And so on for any other language. Do not mix languages in your response.""")
 system_tmpl = SystemMessagePromptTemplate.from_template(system_prompt)
 
 chat_prompt = ChatPromptTemplate.from_messages([

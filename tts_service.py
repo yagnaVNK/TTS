@@ -70,7 +70,7 @@ def generate_audio_stream(text: str, language: str):
                     else np.array(chunk, dtype=np.float32)
                 )
 
-                FRAME = 4096
+                FRAME = 8192
                 for start in range(0, arr.shape[0], FRAME):
                     if tts_stop_event.is_set():
                         break
@@ -78,7 +78,7 @@ def generate_audio_stream(text: str, language: str):
                     pcm16 = (seg * 32767).astype(np.int16)
                     yield pcm16.tobytes()
     finally:
-        torch.cuda.empty_cache()
+        pass
 
 
 @app.get("/synthesize")
@@ -88,7 +88,7 @@ def synthesize(
     language: str = Query(..., description="Language code (e.g. 'ja', 'en', 'es')"),
 ):
     """Streams back a WAV audio file using TTS."""
-    background_tasks.add_task(torch.cuda.empty_cache)
+    #background_tasks.add_task(torch.cuda.empty_cache)
     if language not in ['ja', 'en', 'es']:
         language = "en"
     return StreamingResponse(
