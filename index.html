@@ -1,261 +1,530 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Real-Time ASR → LLM → TTS Interface</title>
-
-  <!-- Polyfill for older browsers/vendor prefixes -->
-  <script>
-    if (!navigator.mediaDevices) {
-      navigator.mediaDevices = {};
-    }
-    if (!navigator.mediaDevices.getUserMedia) {
-      navigator.mediaDevices.getUserMedia = function(constraints) {
-        const legacy = navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
-        if (!legacy) {
-          return Promise.reject(new Error('getUserMedia is not implemented in this browser'));
-        }
-        return new Promise((resolve, reject) =>
-          legacy.call(navigator, constraints, resolve, reject)
-        );
-      };
-    }
-  </script>
-
-  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.22/dist/bundle.min.js"></script>
-
-  <style>
-    body { font-family: Arial, sans-serif; background: #f4f4f4; color: #333; display: flex; flex-direction: column; align-items: center; padding: 2rem; }
-    .controls { background: #fff; padding: 1rem 2rem; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 1rem; width: 100%; max-width: 600px; }
-    .controls label { display: inline-block; width: 45%; margin-bottom: 0.5rem; }
-    .controls input { width: 60px; margin-left: 0.5rem; }
-    button { margin: 0.5rem 0.25rem; padding: 0.5rem 1rem; border: none; border-radius: 4px; background: #007bff; color: #fff; cursor: pointer; }
-    button:disabled { background: #999; cursor: not-allowed; }
-    #log { width: 100%; max-width: 600px; height: 300px; overflow-y: auto; }
-    .entry { background: #fff; padding: 0.75rem 1rem; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); margin-bottom: 0.75rem; }
-    .entry .label { font-weight: bold; margin-right: 0.5rem; }
-    .probabilities { margin-top: 0.5rem; }
-    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; margin-right: 0.5rem; color: #fff; }
-    .badge.lang { background: #17a2b8; }
-    .badge.sent { background: #28a745; }
-    .badge.code { background: #6c757d; }
-    .badge.latency { background: #ffc107; }
-  </style>
-
-  <!-- Secure-context detection -->
-  <script>
-    window.addEventListener('load', () => {
-      const startBtn = document.getElementById('startBtn');
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.isSecureContext) {
-        alert(
-          'Microphone access requires a secure context (HTTPS, localhost, or file://).\n' +
-          'Please serve this page over HTTPS or from http://localhost.'
-        );
-        startBtn.disabled = true;
-      }
-    });
-  </script>
-</head>
+    <html>
+    <head>
+        <title>Audio Pipeline Interface</title>
+        <style>
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                color: #333;
+            }
+            
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+                background: rgba(255, 255, 255, 0.95);
+                border-radius: 20px;
+                padding: 30px;
+                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                backdrop-filter: blur(10px);
+            }
+            
+            h1 {
+                text-align: center;
+                color: #4a5568;
+                margin-bottom: 30px;
+                font-size: 2.5em;
+                font-weight: 300;
+            }
+            
+            .controls {
+                display: flex;
+                justify-content: center;
+                gap: 20px;
+                margin-bottom: 30px;
+            }
+            
+            .btn {
+                padding: 15px 30px;
+                border: none;
+                border-radius: 50px;
+                font-size: 16px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.3s ease;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+            
+            .btn-primary {
+                background: linear-gradient(45deg, #667eea, #764ba2);
+                color: white;
+            }
+            
+            .btn-primary:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
+            }
+            
+            .btn-danger {
+                background: linear-gradient(45deg, #ff6b6b, #ee5a24);
+                color: white;
+            }
+            
+            .btn-danger:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 10px 20px rgba(255, 107, 107, 0.3);
+            }
+            
+            .btn:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+                transform: none;
+            }
+            
+            .status {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                gap: 20px;
+                margin-bottom: 30px;
+            }
+            
+            .status-card {
+                background: white;
+                padding: 20px;
+                border-radius: 15px;
+                box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+                border-left: 4px solid #667eea;
+            }
+            
+            .status-card h3 {
+                margin: 0 0 10px 0;
+                color: #4a5568;
+                font-size: 1.1em;
+            }
+            
+            .status-value {
+                font-size: 1.5em;
+                font-weight: 600;
+                color: #667eea;
+            }
+            
+            .conversation {
+                background: white;
+                border-radius: 15px;
+                padding: 20px;
+                box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+                max-height: 400px;
+                overflow-y: auto;
+            }
+            
+            .message {
+                margin: 15px 0;
+                padding: 15px;
+                border-radius: 15px;
+                animation: fadeIn 0.3s ease;
+            }
+            
+            .message.user {
+                background: linear-gradient(45deg, #667eea, #764ba2);
+                color: white;
+                margin-left: 20%;
+            }
+            
+            .message.assistant {
+                background: #f7fafc;
+                border: 1px solid #e2e8f0;
+                margin-right: 20%;
+            }
+            
+            .message.system {
+                background: #fff5f5;
+                border: 1px solid #fed7d7;
+                text-align: center;
+                font-style: italic;
+                color: #c53030;
+            }
+            
+            .timing-info {
+                font-size: 0.8em;
+                opacity: 0.7;
+                margin-top: 5px;
+            }
+            
+            .recording-indicator {
+                display: none;
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                background: #ff4757;
+                color: white;
+                padding: 10px 20px;
+                border-radius: 25px;
+                animation: pulse 1s infinite;
+                z-index: 1000;
+            }
+            
+            .recording-indicator.active {
+                display: block;
+            }
+            
+            @keyframes fadeIn {
+                from { opacity: 0; transform: translateY(10px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+            
+            @keyframes pulse {
+                0% { transform: scale(1); }
+                50% { transform: scale(1.05); }
+                100% { transform: scale(1); }
+            }
+            
+            .progress-bar {
+                width: 100%;
+                height: 4px;
+                background: #e2e8f0;
+                border-radius: 2px;
+                overflow: hidden;
+                margin: 10px 0;
+            }
+            
+            .progress-fill {
+                height: 100%;
+                background: linear-gradient(90deg, #667eea, #764ba2);
+                width: 0%;
+                transition: width 0.3s ease;
+            }
+        </style>
+    </head>
 <body>
-  <div class="controls">
-    <label>LangProb Threshold:<input id="langThreshold" type="number" step="0.01" value="0.7"/></label>
-    <label>SentProb Threshold:<input id="sentThreshold" type="number" step="0.01" value="0.5"/></label>
-    <div>
-      <button id="startBtn">Start Listening</button>
-      <button id="stopBtn" disabled>Stop</button>
+    <div class="container">
+        <h1>🎤 Audio Pipeline Interface</h1>
+        <div class="controls">
+            <button id="startBtn" class="btn btn-primary">Start Listening</button>
+            <button id="stopBtn" class="btn btn-danger" disabled>Stop Listening</button>
+        </div>
+        <div class="status">
+            <div class="status-card">
+                <h3>Connection Status</h3>
+                <div id="connectionStatus" class="status-value">Disconnected</div>
+            </div>
+            <div class="status-card">
+                <h3>ASR Latency</h3>
+                <div id="asrLatency" class="status-value">-</div>
+            </div>
+            <div class="status-card">
+                <h3>LLM Latency</h3>
+                <div id="llmLatency" class="status-value">-</div>
+            </div>
+            <div class="status-card">
+                <h3>TTS Latency</h3>
+                <div id="ttsLatency" class="status-value">-</div>
+            </div>
+        </div>
+        <div class="conversation" id="conversation">
+            <div class="message system">
+                Welcome! Click "Start Listening" to begin voice conversation.
+            </div>
+        </div>
     </div>
-  </div>
+    <div id="recordingIndicator" class="recording-indicator">
+        🎤 Recording...
+    </div>
+      <script>
+        let ws = null;
+        let audioContext = null;
+        let isRecording = false;
+        let currentAudio = null;
+        let playbackSources = []; // TRACK ALL SOURCES
 
-  <div id="log"></div>
-  <audio id="ttsPlayer" controls></audio>
+        // Audio queue variables
+        let audioQueue = [];
+        let isPlayingQueue = false;
+        let nextPlayTime = 0;
 
-  <script>
-    const HOST      = "https://135.181.63.198";
-    const ASR_URL   = `${HOST}/api/asr`;
-    const CHAT_URL  = `${HOST}/api/chat`;
-    const TTS_URL   = `${HOST}/synthesize`;
-    const STOP_URL  = `${HOST}/stop`;
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const connectionStatus = document.getElementById('connectionStatus');
+        const conversation = document.getElementById('conversation');
+        const recordingIndicator = document.getElementById('recordingIndicator');
 
-    let myvad, micStream, isProcessing = false;
-    let ttsQueue = [], isTTSEnqueued = false;
-    const ttsPlayer = document.getElementById('ttsPlayer');
-
-    function logSimple(label, htmlContent) {
-      const entry = document.createElement('div');
-      entry.className = 'entry';
-      entry.innerHTML = `<span class="label">${label}:</span> ${htmlContent}`;
-      document.getElementById('log').prepend(entry);
-    }
-
-    async function enqueueTTS(text, language) {
-      try { await fetch(STOP_URL, { method: "POST" }); } catch {/*ignore*/}
-      ttsQueue = [];
-      if (!ttsPlayer.paused) {
-        ttsPlayer.pause();
-        ttsPlayer.currentTime = 0;
-      }
-      ttsQueue.push({ text, language });
-      processTTSQueue();
-    }
-
-    async function processTTSQueue() {
-      if (isTTSEnqueued || !ttsQueue.length) return;
-      const { text, language } = ttsQueue.shift();
-      isTTSEnqueued = true;
-      ttsPlayer.pause();
-      ttsPlayer.currentTime = 0;
-
-      // Measure TTS first-playable latency
-      const ttsStart = performance.now();
-      function onCanPlay() {
-        const ttsLatency = ((performance.now() - ttsStart) / 1000).toFixed(2);
-        logSimple('TTS Latency', `<span class="badge latency">${ttsLatency}s</span>`);
-        ttsPlayer.removeEventListener('canplay', onCanPlay);
-      }
-      ttsPlayer.addEventListener('canplay', onCanPlay);
-
-      ttsPlayer.src = `${TTS_URL}?text=${encodeURIComponent(text)}&language=${language}`;
-      try {
-        await ttsPlayer.play();
-      } catch (e) {
-        if (e.name !== 'AbortError') console.error(e);
-      }
-    }
-
-    ttsPlayer.addEventListener('ended', () => {
-      isTTSEnqueued = false;
-      processTTSQueue();
-      if (!myvad || myvad.state === 'passive') isProcessing = false;
-    });
-
-    let abortController = null;
-
-    async function startListening() {
-      const LANG_THRESHOLD = +document.getElementById('langThreshold').value;
-      const SENT_THRESHOLD = +document.getElementById('sentThreshold').value;
-      startBtn.disabled = true;
-      stopBtn.disabled = false;
-
-      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-      myvad = await vad.MicVAD.new({
-        stream: micStream,
-        onSpeechStart: () => {
-          if (abortController) abortController.abort();
-          if (!ttsPlayer.paused) {
-            ttsPlayer.pause();
-            ttsPlayer.currentTime = 0;
-          }
-          ttsQueue = [];
-          isTTSEnqueued = false;
-          isProcessing = false;
-        },
-        onSpeechEnd: async (audio) => {
-          if (isProcessing) return;
-          isProcessing = true;
-          abortController = new AbortController();
-          const signal = abortController.signal;
-
-          // ASR: measure TTFB
-          const asrStart = performance.now();
-          let asrRaw;
-          try {
-            asrRaw = await fetch(ASR_URL, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                audio: Array.from(audio),
-                chunk: 512,
-                lang_threshold: LANG_THRESHOLD,
-                sent_threshold: SENT_THRESHOLD
-              }),
-              signal
-            });
-          } catch (e) {
-            isProcessing = false;
-            if (e.name !== 'AbortError') console.error(e);
-            return;
-          }
-          const asrTTFB = ((performance.now() - asrStart) / 1000).toFixed(2);
-          const asrResp = await asrRaw.json();
-
-          // Log ASR results + latency
-          const userEntry = document.createElement('div');
-          userEntry.className = 'entry';
-          userEntry.innerHTML = `
-            <span class="label">You said:</span> ${asrResp.text}
-            <div class="probabilities">
-              <span class="badge lang">Lang Prob: ${asrResp.lang_prob.toFixed(2)}</span>
-              <span class="badge sent">Sent Prob: ${asrResp.sent_prob.toFixed(2)}</span>
-              <span class="badge code">Lang: ${asrResp.language}</span>
-              <span class="badge latency">ASR TTFB: ${asrTTFB}s</span>
-            </div>`;
-          document.getElementById('log').prepend(userEntry);
-
-          // Chat: measure TTFB
-          let replyText = 'Sorry, I didn’t catch that.';
-          let chatTTFB = null;
-          if (asrResp.is_confident) {
-            const chatStart = performance.now();
-            let chatRaw;
-            try {
-              chatRaw = await fetch(CHAT_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ input: asrResp.text }),
-                signal
-              });
-            } catch (e) {
-              if (e.name !== 'AbortError') console.error(e);
+        function addMessage(type, content, timing = null) {
+            const message = document.createElement('div');
+            message.className = `message ${type}`;
+            message.innerHTML = content;
+            if (timing) {
+                const timingDiv = document.createElement('div');
+                timingDiv.className = 'timing-info';
+                timingDiv.textContent = timing;
+                message.appendChild(timingDiv);
             }
-            if (chatRaw) {
-              chatTTFB = ((performance.now() - chatStart) / 1000).toFixed(2);
-              const chatResp = await chatRaw.json();
-              replyText = chatResp.reply;
-            }
-          }
-
-          // Log assistant reply + chat latency
-          if (chatTTFB !== null) {
-            logSimple('Assistant', `
-              ${replyText}
-              <span class="badge latency">Chat TTFB: ${chatTTFB}s</span>
-            `);
-          } else {
-            logSimple('Assistant', replyText);
-          }
-
-          // Enqueue TTS
-          await enqueueTTS(replyText, asrResp.language);
-          isProcessing = false;
+            conversation.appendChild(message);
+            conversation.scrollTop = conversation.scrollHeight;
         }
-      });
 
-      await myvad.start();
-    }
+        function updateStatus(elementId, value) {
+            document.getElementById(elementId).textContent = value;
+        }
 
-    function stopListening() {
-      startBtn.disabled = false;
-      stopBtn.disabled = true;
-      if (myvad) myvad.pause();
-      if (micStream) {
-        micStream.getTracks().forEach(t => t.stop());
-        micStream = null;
-      }
-      if (!ttsPlayer.paused) {
-        ttsPlayer.pause();
-        ttsPlayer.currentTime = 0;
-      }
-      ttsQueue = [];
-      isProcessing = false;
-    }
+        function stopAllAudioPlayback() {
+            // Stop and clear all currently playing AudioBufferSourceNodes
+            playbackSources.forEach(src => {
+                try { src.stop(); } catch(e) {}
+            });
+            playbackSources = [];
+            
+            // Clear the audio queue
+            audioQueue = [];
+            isPlayingQueue = false;
+            nextPlayTime = 0;
+            
+            if (currentAudio) {
+                try { currentAudio.pause(); } catch(e) {}
+                currentAudio = null;
+            }
+        }
 
-    const startBtn = document.getElementById('startBtn');
-    const stopBtn  = document.getElementById('stopBtn');
-    startBtn.addEventListener('click', startListening);
-    stopBtn.addEventListener('click', stopListening);
-  </script>
-</body>
-</html>
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`ws://127.0.0.1:8000/ws`);
+
+            ws.onopen = function() {
+                updateStatus('connectionStatus', 'Connected');
+                startBtn.disabled = false;
+            };
+
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                handleMessage(data);
+            };
+
+            ws.onclose = function() {
+                updateStatus('connectionStatus', 'Disconnected');
+                startBtn.disabled = true;
+                stopBtn.disabled = true;
+                stopAllAudioPlayback();
+            };
+
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+                updateStatus('connectionStatus', 'Error');
+                stopAllAudioPlayback();
+            };
+        }
+
+        function handleMessage(data) {
+            switch(data.type) {
+                case 'connected':
+                    addMessage('system', data.message);
+                    break;
+
+                case 'speech_detected':
+                    recordingIndicator.classList.add('active');
+                    stopAllAudioPlayback(); // Stop any TTS playback immediately!
+                    break;
+
+                case 'speech_ended':
+                    recordingIndicator.classList.remove('active');
+                    break;
+
+                case 'asr_result':
+                    updateStatus('asrLatency', `${data.latency_ms.toFixed(1)}ms`);
+                    if (data.text) {
+                        addMessage('user', data.text, 
+                            `Confidence: ${(data.average_probability * 100).toFixed(1)}%`);
+                    }
+                    break;
+
+                case 'llm_result':
+                    updateStatus('llmLatency', `${data.latency_ms.toFixed(1)}ms`);
+                    if (!data.low_confidence) {
+                        addMessage('assistant', data.response);
+                    }
+                    break;
+
+                case 'tts_first_chunk':
+                    updateStatus('ttsLatency', `${data.latency_ms.toFixed(1)}ms`);
+                    // Initialize queue for new TTS response
+                    if (!isPlayingQueue) {
+                        initializeAudioQueue();
+                    }
+                    break;
+
+                case 'audio_chunk':
+                    queueAudioChunk(data.audio_data, data.sample_rate);
+                    break;
+
+                case 'response_cancelled':
+                    addMessage('system', 'Response cancelled - new speech detected');
+                    stopAllAudioPlayback();
+                    break;
+
+                case 'tts_cancelled':
+                    stopAllAudioPlayback();
+                    break;
+
+                case 'error':
+                    addMessage('system', `Error: ${data.message}`);
+                    stopAllAudioPlayback();
+                    break;
+            }
+        }
+
+        function initializeAudioQueue() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            
+            // Reset queue state
+            audioQueue = [];
+            isPlayingQueue = true;
+            nextPlayTime = audioContext.currentTime;
+        }
+
+        function queueAudioChunk(audioData, sampleRate) {
+            try {
+                // Convert base64 to audio buffer
+                const binaryString = atob(audioData);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                const int16Array = new Int16Array(bytes.buffer);
+                
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                
+                const audioBuffer = audioContext.createBuffer(1, int16Array.length, sampleRate);
+                const channelData = audioBuffer.getChannelData(0);
+                for (let i = 0; i < int16Array.length; i++) {
+                    channelData[i] = int16Array[i] / 32768.0;
+                }
+
+                // Add to queue instead of playing immediately
+                audioQueue.push({
+                    buffer: audioBuffer,
+                    duration: audioBuffer.duration
+                });
+
+                // Start playing if this is the first chunk
+                if (audioQueue.length === 1 && isPlayingQueue) {
+                    playNextInQueue();
+                }
+
+            } catch (error) {
+                console.error('Error processing audio chunk:', error);
+            }
+        }
+
+        function playNextInQueue() {
+            if (!isPlayingQueue || audioQueue.length === 0) {
+                return;
+            }
+
+            const audioItem = audioQueue.shift();
+            const source = audioContext.createBufferSource();
+            source.buffer = audioItem.buffer;
+            source.connect(audioContext.destination);
+
+            // Calculate when to start this chunk
+            const startTime = Math.max(audioContext.currentTime, nextPlayTime);
+            source.start(startTime);
+            
+            // Update next play time
+            nextPlayTime = startTime + audioItem.duration;
+
+            // Track the source for cleanup
+            playbackSources.push(source);
+
+            // Set up to play next chunk when this one ends
+            source.onended = () => {
+                playbackSources = playbackSources.filter(s => s !== source);
+                
+                // Play next chunk if queue is still active
+                if (isPlayingQueue) {
+                    playNextInQueue();
+                } else if (audioQueue.length === 0) {
+                    // Queue is finished
+                    isPlayingQueue = false;
+                    nextPlayTime = 0;
+                }
+            };
+
+            // Handle case where source is stopped before ending naturally
+            const originalStop = source.stop.bind(source);
+            source.stop = function(...args) {
+                playbackSources = playbackSources.filter(s => s !== source);
+                originalStop(...args);
+            };
+
+        }
+
+        async function startRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    } 
+                });
+
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                const source = audioContext.createMediaStreamSource(stream);
+                const processor = audioContext.createScriptProcessor(8192, 1, 1);
+
+                processor.onaudioprocess = function(e) {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        const audioData = new Float32Array(inputData);
+                        // Convert to base64
+                        const buffer = new ArrayBuffer(audioData.length * 4);
+                        const view = new Float32Array(buffer);
+                        view.set(audioData);
+                        const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
+                        ws.send(JSON.stringify({
+                            type: 'audio',
+                            data: base64
+                        }));
+                    }
+                };
+
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+
+                isRecording = true;
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+
+                // Store references for cleanup
+                window.audioStream = stream;
+                window.audioProcessor = processor;
+                window.audioSource = source;
+
+            } catch (error) {
+                console.error('Error starting recording:', error);
+                addMessage('system', 'Error: Could not access microphone');
+            }
+        }
+
+        function stopRecording() {
+            if (window.audioStream) {
+                window.audioStream.getTracks().forEach(track => track.stop());
+            }
+            if (window.audioProcessor) {
+                window.audioProcessor.disconnect();
+            }
+            if (window.audioSource) {
+                window.audioSource.disconnect();
+            }
+            isRecording = false;
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            recordingIndicator.classList.remove('active');
+        }
+
+        startBtn.addEventListener('click', startRecording);
+        stopBtn.addEventListener('click', stopRecording);
+
+        // Initialize connection
+        connectWebSocket();
+    </script>      
+    </body>
+    </html>
