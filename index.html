@@ -4,81 +4,59 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Real-Time ASR → LLM → TTS Interface</title>
+
+  <!-- Polyfill for older browsers/vendor prefixes -->
+  <script>
+    if (!navigator.mediaDevices) {
+      navigator.mediaDevices = {};
+    }
+    if (!navigator.mediaDevices.getUserMedia) {
+      navigator.mediaDevices.getUserMedia = function(constraints) {
+        const legacy = navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+        if (!legacy) {
+          return Promise.reject(new Error('getUserMedia is not implemented in this browser'));
+        }
+        return new Promise((resolve, reject) =>
+          legacy.call(navigator, constraints, resolve, reject)
+        );
+      };
+    }
+  </script>
+
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.22/dist/bundle.min.js"></script>
+
   <style>
-    body {
-      font-family: Arial, sans-serif;
-      background: #f4f4f4;
-      color: #333;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      padding: 2rem;
-    }
-    .controls {
-      background: #fff;
-      padding: 1rem 2rem;
-      border-radius: 8px;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-      margin-bottom: 1rem;
-      width: 100%;
-      max-width: 600px;
-    }
-    .controls label {
-      display: inline-block;
-      width: 45%;
-      margin-bottom: 0.5rem;
-    }
-    .controls input {
-      width: 60px;
-      margin-left: 0.5rem;
-    }
-    button {
-      margin: 0.5rem 0.25rem;
-      padding: 0.5rem 1rem;
-      border: none;
-      border-radius: 4px;
-      background: #007bff;
-      color: #fff;
-      cursor: pointer;
-    }
-    button:disabled {
-      background: #999;
-      cursor: not-allowed;
-    }
-    #log {
-      width: 100%;
-      max-width: 600px;
-      height: 300px;
-      overflow-y: auto;
-    }
-    .entry {
-      background: #fff;
-      padding: 0.75rem 1rem;
-      border-radius: 8px;
-      box-shadow: 0 1px 4px rgba(0,0,0,0.1);
-      margin-bottom: 0.75rem;
-    }
-    .entry .label {
-      font-weight: bold;
-      margin-right: 0.5rem;
-    }
-    .probabilities {
-      margin-top: 0.5rem;
-    }
-    .badge {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 12px;
-      font-size: 0.75rem;
-      margin-right: 0.5rem;
-      color: #fff;
-    }
+    body { font-family: Arial, sans-serif; background: #f4f4f4; color: #333; display: flex; flex-direction: column; align-items: center; padding: 2rem; }
+    .controls { background: #fff; padding: 1rem 2rem; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 1rem; width: 100%; max-width: 600px; }
+    .controls label { display: inline-block; width: 45%; margin-bottom: 0.5rem; }
+    .controls input { width: 60px; margin-left: 0.5rem; }
+    button { margin: 0.5rem 0.25rem; padding: 0.5rem 1rem; border: none; border-radius: 4px; background: #007bff; color: #fff; cursor: pointer; }
+    button:disabled { background: #999; cursor: not-allowed; }
+    #log { width: 100%; max-width: 600px; height: 300px; overflow-y: auto; }
+    .entry { background: #fff; padding: 0.75rem 1rem; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); margin-bottom: 0.75rem; }
+    .entry .label { font-weight: bold; margin-right: 0.5rem; }
+    .probabilities { margin-top: 0.5rem; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; margin-right: 0.5rem; color: #fff; }
     .badge.lang { background: #17a2b8; }
     .badge.sent { background: #28a745; }
     .badge.code { background: #6c757d; }
+    .badge.latency { background: #ffc107; }
   </style>
+
+  <!-- Secure-context detection -->
+  <script>
+    window.addEventListener('load', () => {
+      const startBtn = document.getElementById('startBtn');
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.isSecureContext) {
+        alert(
+          'Microphone access requires a secure context (HTTPS, localhost, or file://).\n' +
+          'Please serve this page over HTTPS or from http://localhost.'
+        );
+        startBtn.disabled = true;
+      }
+    });
+  </script>
 </head>
 <body>
   <div class="controls">
@@ -94,69 +72,62 @@
   <audio id="ttsPlayer" controls></audio>
 
   <script>
-    const HOST      = "http://127.0.0.1";
-    const ASR_URL   = `${HOST}:8002/api/asr`;
-    const CHAT_URL  = `${HOST}:8003/api/chat`;
-    const TTS_URL   = `${HOST}:8004/synthesize`;
-    const STOP_URL  = `${HOST}:8004/stop`;
+    const HOST      = "https://135.181.63.198";
+    const ASR_URL   = `${HOST}/api/asr`;
+    const CHAT_URL  = `${HOST}/api/chat`;
+    const TTS_URL   = `${HOST}/synthesize`;
+    const STOP_URL  = `${HOST}/stop`;
 
-    let myvad, isProcessing = false;
+    let myvad, micStream, isProcessing = false;
     let ttsQueue = [], isTTSEnqueued = false;
     const ttsPlayer = document.getElementById('ttsPlayer');
 
-    function logSimple(label, text) {
+    function logSimple(label, htmlContent) {
       const entry = document.createElement('div');
       entry.className = 'entry';
-      entry.innerHTML = `<span class="label">${label}:</span> ${text}`;
+      entry.innerHTML = `<span class="label">${label}:</span> ${htmlContent}`;
       document.getElementById('log').prepend(entry);
     }
 
     async function enqueueTTS(text, language) {
-      try {
-        await fetch(STOP_URL, { method: "POST" });
-        console.log("Called /stop to cancel previous TTS.");
-      } catch (e) {
-        console.warn("Failed to call /stop", e);
-      }
-
-      // Stop frontend TTS
+      try { await fetch(STOP_URL, { method: "POST" }); } catch {/*ignore*/}
       ttsQueue = [];
       if (!ttsPlayer.paused) {
         ttsPlayer.pause();
         ttsPlayer.currentTime = 0;
       }
-
-      // Queue new TTS
       ttsQueue.push({ text, language });
       processTTSQueue();
     }
 
     async function processTTSQueue() {
-      if (isTTSEnqueued || ttsQueue.length === 0) return;
+      if (isTTSEnqueued || !ttsQueue.length) return;
       const { text, language } = ttsQueue.shift();
       isTTSEnqueued = true;
-
       ttsPlayer.pause();
       ttsPlayer.currentTime = 0;
-      ttsPlayer.src = `${TTS_URL}?text=${encodeURIComponent(text)}&language=${language}`;
 
+      // Measure TTS first-playable latency
+      const ttsStart = performance.now();
+      function onCanPlay() {
+        const ttsLatency = ((performance.now() - ttsStart) / 1000).toFixed(2);
+        logSimple('TTS Latency', `<span class="badge latency">${ttsLatency}s</span>`);
+        ttsPlayer.removeEventListener('canplay', onCanPlay);
+      }
+      ttsPlayer.addEventListener('canplay', onCanPlay);
+
+      ttsPlayer.src = `${TTS_URL}?text=${encodeURIComponent(text)}&language=${language}`;
       try {
         await ttsPlayer.play();
       } catch (e) {
-        if (e.name === 'AbortError') {
-          console.log('TTS play aborted due to new speech. Ignoring.');
-        } else {
-          console.error('TTS play error', e);
-        }
+        if (e.name !== 'AbortError') console.error(e);
       }
     }
 
     ttsPlayer.addEventListener('ended', () => {
       isTTSEnqueued = false;
       processTTSQueue();
-      if (!myvad || myvad.state === 'passive') {
-        isProcessing = false;
-      }
+      if (!myvad || myvad.state === 'passive') isProcessing = false;
     });
 
     let abortController = null;
@@ -164,39 +135,34 @@
     async function startListening() {
       const LANG_THRESHOLD = +document.getElementById('langThreshold').value;
       const SENT_THRESHOLD = +document.getElementById('sentThreshold').value;
-
       startBtn.disabled = true;
-      stopBtn.disabled  = false;
+      stopBtn.disabled = false;
+
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
       myvad = await vad.MicVAD.new({
+        stream: micStream,
         onSpeechStart: () => {
-          console.log('Speech started');
-
-          if (abortController) {
-            abortController.abort();
-            console.log("Previous ASR/chat request aborted.");
-          }
-
-          // Stop frontend TTS
+          if (abortController) abortController.abort();
           if (!ttsPlayer.paused) {
             ttsPlayer.pause();
             ttsPlayer.currentTime = 0;
           }
-
           ttsQueue = [];
           isTTSEnqueued = false;
           isProcessing = false;
         },
-
         onSpeechEnd: async (audio) => {
           if (isProcessing) return;
           isProcessing = true;
-
           abortController = new AbortController();
           const signal = abortController.signal;
 
+          // ASR: measure TTFB
+          const asrStart = performance.now();
+          let asrRaw;
           try {
-            const asrResp = await fetch(ASR_URL, {
+            asrRaw = await fetch(ASR_URL, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -206,44 +172,64 @@
                 sent_threshold: SENT_THRESHOLD
               }),
               signal
-            }).then(r => r.json());
+            });
+          } catch (e) {
+            isProcessing = false;
+            if (e.name !== 'AbortError') console.error(e);
+            return;
+          }
+          const asrTTFB = ((performance.now() - asrStart) / 1000).toFixed(2);
+          const asrResp = await asrRaw.json();
 
-            const userEntry = document.createElement('div');
-            userEntry.className = 'entry';
-            userEntry.innerHTML = `
-              <span class="label">You said:</span> ${asrResp.text}
-              <div class="probabilities">
-                <span class="badge lang">Lang Prob: ${asrResp.lang_prob.toFixed(2)}</span>
-                <span class="badge sent">Sent Prob: ${asrResp.sent_prob.toFixed(2)}</span>
-                <span class="badge code">Lang: ${asrResp.language}</span>
-              </div>
-            `;
-            document.getElementById('log').prepend(userEntry);
+          // Log ASR results + latency
+          const userEntry = document.createElement('div');
+          userEntry.className = 'entry';
+          userEntry.innerHTML = `
+            <span class="label">You said:</span> ${asrResp.text}
+            <div class="probabilities">
+              <span class="badge lang">Lang Prob: ${asrResp.lang_prob.toFixed(2)}</span>
+              <span class="badge sent">Sent Prob: ${asrResp.sent_prob.toFixed(2)}</span>
+              <span class="badge code">Lang: ${asrResp.language}</span>
+              <span class="badge latency">ASR TTFB: ${asrTTFB}s</span>
+            </div>`;
+          document.getElementById('log').prepend(userEntry);
 
-            let replyText;
-            if (asrResp.is_confident) {
-              const chatResp = await fetch(CHAT_URL, {
+          // Chat: measure TTFB
+          let replyText = 'Sorry, I didn’t catch that.';
+          let chatTTFB = null;
+          if (asrResp.is_confident) {
+            const chatStart = performance.now();
+            let chatRaw;
+            try {
+              chatRaw = await fetch(CHAT_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ input: asrResp.text }),
                 signal
-              }).then(r => r.json());
+              });
+            } catch (e) {
+              if (e.name !== 'AbortError') console.error(e);
+            }
+            if (chatRaw) {
+              chatTTFB = ((performance.now() - chatStart) / 1000).toFixed(2);
+              const chatResp = await chatRaw.json();
               replyText = chatResp.reply;
-            } else {
-              replyText = 'Sorry, I didn’t catch that.';
             }
-
-            logSimple('Assistant', replyText);
-            await enqueueTTS(replyText, asrResp.language);
-          } catch (err) {
-            if (err.name === 'AbortError') {
-              console.log("ASR/chat request aborted");
-            } else {
-              console.error("Error in processing:", err);
-            }
-          } finally {
-            isProcessing = false;
           }
+
+          // Log assistant reply + chat latency
+          if (chatTTFB !== null) {
+            logSimple('Assistant', `
+              ${replyText}
+              <span class="badge latency">Chat TTFB: ${chatTTFB}s</span>
+            `);
+          } else {
+            logSimple('Assistant', replyText);
+          }
+
+          // Enqueue TTS
+          await enqueueTTS(replyText, asrResp.language);
+          isProcessing = false;
         }
       });
 
@@ -253,13 +239,15 @@
     function stopListening() {
       startBtn.disabled = false;
       stopBtn.disabled = true;
-
       if (myvad) myvad.pause();
+      if (micStream) {
+        micStream.getTracks().forEach(t => t.stop());
+        micStream = null;
+      }
       if (!ttsPlayer.paused) {
         ttsPlayer.pause();
         ttsPlayer.currentTime = 0;
       }
-
       ttsQueue = [];
       isProcessing = false;
     }

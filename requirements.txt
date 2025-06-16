@@ -31,3 +31,5 @@ faster-whisper
 langchain
 langchain_ollama
 torchaudio
+onnx
+python-multipart
