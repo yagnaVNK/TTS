@@ -33,3 +33,7 @@ langchain_ollama
 torchaudio
 onnx
 python-multipart
+websockets
+wsproto
+sudachipy 
+sudachidict_core

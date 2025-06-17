@@ -46,8 +46,8 @@ def main():
     # Define the audio files to resample
     audio_files = [
         {
-            'input': 'default_audio/english_audio2.wav',
-            'output': 'default_audio/english_audio2_8k.wav'
+            'input': 'default_audio/english_audio3.wav',
+            'output': 'default_audio/english_audio3_8k.wav'
         },
         {
             'input': 'default_audio/japanese.wav',
