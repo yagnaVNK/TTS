@@ -95,7 +95,7 @@ class Vad:
 
 # ─── XTTS Model and Speaker Setup ─────────────────────────────────────────────
 
-def get_xtts_model_and_speaker():
+def get_xtts_model_and_speakers():
     torch.set_num_threads(int(os.environ.get("NUM_THREADS", os.cpu_count())))
     device = torch.device("cuda" if os.environ.get("USE_CPU", "0") == "0" else "cpu")
     custom_model_path = os.environ.get("CUSTOM_MODEL_PATH", "/app/tts_models")
@@ -118,27 +118,33 @@ def get_xtts_model_and_speaker():
     model.to(device)
     print("XTTS Loaded.\n", flush=True)
 
-    # Use a studio speaker (change index for different voices)
     if hasattr(model, "speaker_manager") and hasattr(model.speaker_manager, "speakers"):
         speakers = list(model.speaker_manager.speakers.keys())
-        default = speakers[0]  # Change index if needed
-        speaker_embedding = model.speaker_manager.speakers[default]["speaker_embedding"].cpu().squeeze().float()
-        gpt_cond_latent = model.speaker_manager.speakers[default]["gpt_cond_latent"].cpu().squeeze().float()
+        speaker_info = []
+        for name in speakers:
+            d = model.speaker_manager.speakers[name]
+            speaker_info.append({
+                "name": name,
+                "has_embedding": "speaker_embedding" in d,
+                "has_gpt_cond_latent": "gpt_cond_latent" in d,
+            })
     else:
-        raise RuntimeError("No speaker embedding found in model. Add your own speaker WAV extraction here.")
+        raise RuntimeError("No speaker embedding found in model.")
 
-    return model, speaker_embedding, gpt_cond_latent
+    return model, model.speaker_manager.speakers, speaker_info
 
-xtts_model, xtts_speaker_embedding, xtts_gpt_cond_latent = get_xtts_model_and_speaker()
+xtts_model, xtts_speakers_dict, speaker_info = get_xtts_model_and_speakers()
+
 
 # ─── ASR, LLM, Prompt Setup ──────────────────────────────────────────────────
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-asr = WhisperModel("base", device=device, compute_type="float16")
+asr = WhisperModel("large-v3", device=device, compute_type="float16")
 llm = ChatOllama(model="gemma3:4b")
 memory = ConversationBufferMemory(memory_key="history", return_messages=True)
 sys_msg = SystemMessagePromptTemplate.from_template(
-    "You are an expert assistant who only responds with short and concise answers without special characters and emojis. Use only . , ? !"
+    "You are an expert assistant who only responds with short and concise answers without special characters and emojis. Use only . , ? !" \
+    "And only answer in the language you are spoken in."
 )
 chat_tpl = ChatPromptTemplate.from_messages([
     sys_msg, MessagesPlaceholder(variable_name="history"),
@@ -157,6 +163,7 @@ class AudioSession:
         self.silence = 0
         self.current_response_id = None
         self.is_processing = False
+        self.selected_speaker = None
 
         # --- TTS thread/cancellation ---
         self.tts_thread = None
@@ -282,8 +289,25 @@ class AudioSession:
                 "response_id": response_id
             })
 
-            emb = xtts_speaker_embedding.unsqueeze(0).unsqueeze(-1).float().to(self.device)
-            cond_latent = xtts_gpt_cond_latent.reshape((-1, 1024)).unsqueeze(0).float().to(self.device)
+            speaker_name = self.selected_speaker or list(xtts_speakers_dict.keys())[0]
+            
+            speaker = xtts_speakers_dict[speaker_name]
+
+            # Speaker embedding: [1, 512, 1]
+            emb = speaker["speaker_embedding"]
+            if emb.ndim == 1:
+                emb = emb[None, :, None]
+            elif emb.ndim == 2:
+                emb = emb[:, :, None]
+            emb = emb.float().to(self.device)
+
+            # gpt_cond_latent: [1, N, 1024]
+            cond_latent = speaker["gpt_cond_latent"]
+            if cond_latent.ndim == 1:
+                cond_latent = cond_latent[None, None, :]
+            elif cond_latent.ndim == 2:
+                cond_latent = cond_latent[None, :, :]
+            cond_latent = cond_latent.float().to(self.device)
 
             for i, chunk in enumerate(xtts_model.inference_stream(
                 text=response,
@@ -356,6 +380,10 @@ async def websocket_endpoint(websocket: WebSocket):
         "message": "Connected to audio pipeline",
         "sample_rate": SR_PROC
     })
+    # Send speaker list!
+    await session.send_message("speaker_list", {
+        "speakers": [s["name"] for s in speaker_info]
+    })
 
     try:
         while True:
@@ -371,6 +399,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 if audio_f32.ndim > 1:
                     audio_f32 = audio_f32.mean(axis=1)
                 await session.process_audio_chunk(audio_f32)
+            elif message["type"] == "select_speaker":
+                session.selected_speaker = message["speaker"]
+                await session.send_message("speaker_selected", {"speaker": session.selected_speaker})
     except WebSocketDisconnect:
         print(f"Session {session_id} disconnected")
     except Exception as e:
@@ -575,6 +606,10 @@ async def get_index():
 <body>
     <div class="container">
         <h1>🎤 Audio Pipeline Interface</h1>
+        <div style="margin-bottom:20px">
+            <label for="speakerSelect"><b>Speaker:</b></label>
+            <select id="speakerSelect"></select>
+        </div>
         <div class="controls">
             <button id="startBtn" class="btn btn-primary">Start Listening</button>
             <button id="stopBtn" class="btn btn-danger" disabled>Stop Listening</button>
@@ -687,13 +722,35 @@ async def get_index():
                 stopAllAudioPlayback();
             };
         }
-
+        function populateSpeakerList(speakers) {
+            speakerSelect.innerHTML = "";
+            speakers.forEach(spk => {
+                const option = document.createElement('option');
+                option.value = spk;
+                option.textContent = spk;
+                speakerSelect.appendChild(option);
+            });
+        }
+        speakerSelect.addEventListener('change', function() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'select_speaker',
+                    speaker: speakerSelect.value
+                }));
+            }
+        });
+                                
         function handleMessage(data) {
             switch(data.type) {
                 case 'connected':
                     addMessage('system', data.message);
                     break;
-
+                case 'speaker_list':
+                    populateSpeakerList(data.speakers);
+                    break;
+                case 'speaker_selected':
+                    addMessage('system', `Speaker changed to: ${data.speaker}`);
+                    break;
                 case 'speech_detected':
                     recordingIndicator.classList.add('active');
                     stopAllAudioPlayback(); // Stop any TTS playback immediately!
