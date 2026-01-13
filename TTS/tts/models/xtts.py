@@ -69,8 +69,24 @@ def wav_to_mel_cloning(
 def load_audio(audiopath, sampling_rate):
     # better load setting following: https://github.com/faroit/python_audio_loading_benchmark
 
-    # torchaudio should chose proper backend to load audio depending on platform
-    audio, lsr = torchaudio.load(audiopath)
+    # Try to load audio with torchaudio first (preferred). If torchaudio
+    # attempts to use TorchCodec and fails (missing FFmpeg DLLs on Windows),
+    # fall back to librosa which can read plain WAVs without TorchCodec.
+    try:
+        audio, lsr = torchaudio.load(audiopath)
+    except Exception as e:
+        # Only print a short warning and fallback to librosa for compatibility
+        print(f"torchaudio.load failed ({e}); falling back to librosa.load for {audiopath}")
+        try:
+            wav, lsr = librosa.load(audiopath, sr=sampling_rate, mono=True)
+            import torch as _torch
+
+            audio = _torch.from_numpy(wav).unsqueeze(0)
+            # librosa already resampled to sampling_rate above
+            lsr = sampling_rate
+        except Exception as e2:
+            # re-raise the original error if fallback also fails
+            raise RuntimeError(f"Failed to load audio '{audiopath}': {e}; fallback error: {e2}")
 
     # stereo to mono if needed
     if audio.size(0) != 1:
